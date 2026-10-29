@@ -1,0 +1,99 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag, or commit to build (defaults to the selected branch)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+concurrency:
+  group: build-${{ github.ref }}-${{ inputs.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore
+        run: dotnet restore DisplayProfileManager.sln
+
+      - name: Run tests
+        run: dotnet test DisplayProfileManager.Tests/DisplayProfileManager.Tests.csproj --configuration Release --no-restore -p:Platform=x64
+
+      - name: Build application x64
+        run: >
+          msbuild DisplayProfileManager/DisplayProfileManager.csproj
+          /restore
+          /p:Configuration=Release
+          /p:Platform=x64
+          /p:RuntimeIdentifier=win-x64
+          /p:SelfContained=false
+          /p:SolutionDir="${{ github.workspace }}\"
+
+      - name: Build shell extension x64
+        run: >
+          msbuild DisplayProfileManager.ShellExt/DisplayProfileManager.ShellExt.vcxproj
+          /p:Configuration=Release
+          /p:Platform=x64
+          /p:SolutionDir="${{ github.workspace }}\"
+
+      - name: Package portable zip
+        id: package
+        shell: pwsh
+        run: |
+          $exclude = @('*.pdb', '*.xml', '*.tmp', '*.log', '*.exp', '*.lib')
+          $src  = "DisplayProfileManager/bin/x64/Release"
+          $dest = "dist/portable/x64"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+
+          Get-ChildItem -Path $src -File | Where-Object {
+            $name = $_.Name
+            -not ($exclude | Where-Object { $name -like $_ })
+          } | Copy-Item -Destination $dest
+
+          $runtimes = Join-Path $src 'runtimes'
+          if (Test-Path $runtimes) {
+            Copy-Item -Path $runtimes -Destination $dest -Recurse -Force
+          }
+
+          Copy-Item -Path "LICENSE", "THIRD-PARTY-LICENSES.md" -Destination $dest
+
+          $describe = (git describe --tags --always --dirty).Trim()
+          $zip = "dist/DisplayProfileManager-$describe-x64-Portable.zip"
+          Compress-Archive -Path "$dest/*" -DestinationPath $zip
+          "name=DisplayProfileManager-$describe-x64-Portable" >> $env:GITHUB_OUTPUT
+          Write-Host "Packaged $zip"
+
+      - name: Upload portable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/*.zip
+          if-no-files-found: error
